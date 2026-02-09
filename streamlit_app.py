@@ -3,18 +3,21 @@ import pandas as pd
 import numpy as np
 
 # Configurazione pagina
-st.set_page_config(page_title="Report Incentivi FV", layout="wide")
+st.set_page_config(page_title="Monitoraggio Resa FV", layout="wide")
 
 def load_irraggiamento():
-    # Caricamento file irraggiamento.csv (separatore ;)
+    # Carica il file locale irraggiamento.csv
+    # Il file ha le prime due righe sporche e usa il punto e virgola
     df = pd.read_csv('irraggiamento.csv', sep=';', encoding='latin-1', skiprows=2)
-    df.columns = ['Prov', 'Comune', 'Irraggiamento']
-    # Pulizia dati: rimuove righe vuote e converte i valori numerici (virgola -> punto)
-    df = df.dropna(subset=['Comune', 'Irraggiamento'])
-    df['Irraggiamento'] = df['Irraggiamento'].astype(str).str.replace(',', '.').astype(float)
+    df.columns = ['Prov', 'Comune', 'Irr_1kW']
+    
+    # Pulizia: rimuove righe senza comune e converte i numeri (es. 1.606,70 -> 1606.70)
+    df = df.dropna(subset=['Comune', 'Irr_1kW'])
+    df['Irr_1kW'] = df['Irr_1kW'].astype(str).str.replace('.', '', regex=False).str.replace(',', '.', regex=False).astype(float)
     return df
 
 def get_color(loss_pct):
+    """Restituisce lo stile CSS basato sulla percentuale di perdita rispetto al target"""
     if loss_pct < 5:
         return 'background-color: green; color: white'
     elif 5 <= loss_pct < 10:
@@ -28,58 +31,71 @@ def get_color(loss_pct):
     else:
         return 'background-color: black; color: white'
 
-# --- UI SIDEBAR ---
-st.sidebar.header("Parametri")
-df_irr = load_irraggiamento()
-comune_scelto = st.sidebar.selectbox("Seleziona Comune", options=sorted(df_irr['Comune'].unique()))
+# --- INTERFACCIA LATERALE ---
+st.sidebar.header("Configurazione")
+try:
+    df_irr = load_irraggiamento()
+    comune_scelto = st.sidebar.selectbox("Seleziona il Comune dell'impianto", options=sorted(df_irr['Comune'].unique()))
+    
+    # Valore di irraggiamento (kWh prodotti attesi per 1 kWp)
+    irr_specifico = df_irr[df_irr['Comune'] == comune_scelto]['Irr_1kW'].values[0]
+    st.sidebar.info(f"Resa teorica comune: {irr_specifico:.2f} kWh/kWp")
+except Exception as e:
+    st.sidebar.error(f"Errore caricamento irraggiamento.csv: {e}")
 
-# Ottieni valore irraggiamento per il comune selezionato
-val_irr_annuo = df_irr[df_irr['Comune'] == comune_scelto]['Irraggiamento'].values[0]
-st.sidebar.metric("Irraggiamento Annuo (kWh/kWp)", f"{val_irr_annuo:.2f}")
-
-# --- CARICAMENTO FILE ---
-uploaded_file = st.file_uploader("Carica il file dei pagamenti (CSV o Excel)", type=['csv', 'xlsx', 'xls'])
+# --- CARICAMENTO DATI PRODUZIONE ---
+st.title("Analisi Efficienza Impianto Fotovoltaico")
+uploaded_file = st.file_uploader("Carica il file Excel/CSV degli incentivi GSE", type=['csv', 'xlsx', 'xls'])
 
 if uploaded_file is not None:
     try:
-        # Lettura file in base all'estensione
+        # Lettura file produzione
         if uploaded_file.name.endswith('.csv'):
             df_prod = pd.read_csv(uploaded_file)
         else:
             df_prod = pd.read_excel(uploaded_file)
         
-        # Pulizia colonne produzione
-        # Si assume la presenza di 'ANNO RIFERIMENTO', 'ENERGIA', 'POTENZA IMPIANTO'
-        potenza_impianto = df_prod['POTENZA IMPIANTO'].iloc[0]
+        # Estrazione potenza (si assume costante nel file)
+        potenza_impianto = float(df_prod['POTENZA IMPIANTO'].iloc[0])
         
-        # Calcolo produzione totale per anno
+        # Calcolo Target Annuale Teorico
+        target_annuo_impianto = irr_specifico * potenza_impianto
+        
+        # Aggregazione produzione per anno
+        # Rimuoviamo eventuali valori non numerici o negativi se presenti
+        df_prod['ENERGIA'] = pd.to_numeric(df_prod['ENERGIA'], errors='coerce').fillna(0)
         report = df_prod.groupby('ANNO RIFERIMENTO')['ENERGIA'].sum().reset_index()
-        report.columns = ['Anno', 'Energia Prodotta (kWh)']
+        report.columns = ['Anno', 'Energia Reale (kWh)']
         
-        # Calcolo Target e %
-        target_teorico = val_irr_annuo * potenza_impianto
-        report['Target Atteso (kWh)'] = target_teorico
-        report['Produzione %'] = (report['Energia Prodotta (kWh)'] / target_teorico) * 100
+        # Calcolo scostamenti
+        report['Target Atteso (kWh)'] = target_annuo_impianto
+        report['Produzione %'] = (report['Energia Reale (kWh)'] / target_annuo_impianto) * 100
         report['Perdita %'] = 100 - report['Produzione %']
         
-        # Applicazione colori
-        def style_rows(row):
-            color_style = get_color(row['Perdita %'])
-            return [color_style] * len(row)
-
-        st.subheader(f"Analisi Produzione Impianto ({potenza_impianto} kWp) - Comune: {comune_scelto}")
+        st.subheader(f"Risultati per Impianto da {potenza_impianto} kWp a {comune_scelto}")
         
-        # Visualizzazione tabella formattata
-        styled_df = report.style.apply(style_rows, axis=1).format({
-            'Energia Prodotta (kWh)': '{:.2f}',
+        # Applicazione formattazione condizionale
+        def apply_style(row):
+            color = get_color(row['Perdita %'])
+            return [color] * len(row)
+
+        styled_df = report.style.apply(apply_style, axis=1).format({
+            'Energia Reale (kWh)': '{:.2f}',
             'Target Atteso (kWh)': '{:.2f}',
             'Produzione %': '{:.2f}%',
             'Perdita %': '{:.2f}%'
         })
         
-        st.dataframe(styled_df, use_container_width=True)
+        st.table(styled_df)
         
+        # Riepilogo metriche
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Potenza Impianto", f"{potenza_impianto} kWp")
+        with col2:
+            st.metric("Target Annuo Stimato", f"{target_annuo_impianto:.2f} kWh")
+
     except Exception as e:
-        st.error(f"Errore nella lettura del file: {e}")
+        st.error(f"Errore durante l'elaborazione del file: {e}")
 else:
-    st.info("In attesa del caricamento del file di produzione...")
+    st.warning("Carica un file per visualizzare l'analisi.")
